@@ -60,10 +60,16 @@ class TestRetrieverWithFakeEmbeddings(unittest.TestCase):
 
     def test_retrieve_context_returns_expected_shape(self):
         result = self.retriever.retrieve_context("What is your cancellation policy?", top_k=2)
-        self.assertEqual(set(result.keys()), {"query", "contexts", "scores"})
+        self.assertEqual(set(result.keys()), {"query", "contexts", "scores", "ids"})
         self.assertEqual(result["query"], "What is your cancellation policy?")
         self.assertEqual(len(result["contexts"]), 2)
         self.assertEqual(len(result["scores"]), 2)
+        self.assertEqual(len(result["ids"]), 2)
+
+    def test_retrieve_context_ids_match_insertion_order_position(self):
+        # doc-1 ("A $300 deposit is required...") was the second document added in setUp -> id 1.
+        result = self.retriever.retrieve_context("How much is the deposit?", top_k=1)
+        self.assertEqual(result["ids"], [1])
 
     def test_top_result_matches_the_closest_known_vector(self):
         result = self.retriever.retrieve_context("How much is the deposit?", top_k=1)
@@ -86,7 +92,7 @@ class TestRetrieverWithFakeEmbeddings(unittest.TestCase):
     def test_empty_index_returns_empty_result_not_an_error(self):
         empty_retriever = Retriever(embedding_model="bge-small", vector_db="faiss")
         result = empty_retriever.retrieve_context("anything", top_k=5)
-        self.assertEqual(result, {"query": "anything", "contexts": [], "scores": []})
+        self.assertEqual(result, {"query": "anything", "contexts": [], "scores": [], "ids": []})
 
     def test_save_and_load_round_trip(self):
         tmp_dir = tempfile.mkdtemp()
@@ -115,15 +121,17 @@ class TestRetrieverWithFakeEmbeddings(unittest.TestCase):
         self.assertEqual(len(result["contexts"]), 3)
         self.assertEqual(set(result["contexts"]), set(self._passage_vectors.keys()))
         self.assertEqual(result["scores"], [1.0, 1.0, 1.0])
+        self.assertEqual(result["ids"], [0, 1, 2])
 
     def test_retrieve_all_respects_limit(self):
         result = self.retriever.retrieve_all(limit=2)
         self.assertEqual(len(result["contexts"]), 2)
+        self.assertEqual(len(result["ids"]), 2)
 
     def test_retrieve_all_on_empty_index_returns_empty_result(self):
         empty_retriever = Retriever(embedding_model="bge-small", vector_db="faiss")
         result = empty_retriever.retrieve_all()
-        self.assertEqual(result, {"query": None, "contexts": [], "scores": []})
+        self.assertEqual(result, {"query": None, "contexts": [], "scores": [], "ids": []})
 
 
 @unittest.skipUnless(_FAISS_AVAILABLE, "faiss is not installed")

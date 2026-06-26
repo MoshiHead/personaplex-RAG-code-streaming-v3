@@ -103,7 +103,7 @@ class ServerState:
                  rag_vad_enable: bool = False, rag_turn_injection_top_k: int = 2,
                  rag_dynamic_injection_interval_s: float = 30.0, rag_dynamic_injection_top_k: int = 2,
                  rag_default_query: str = "", rag_full_kb_max_chunks: int | None = None,
-                 rag_max_injection_tokens: int | None = None, rag_injection_reserve_frames: int = 400,
+                 rag_max_injection_tokens: int | None = None, rag_injection_reserve_frames: int = 100,
                  rag_score_threshold: float | None = None, rag_strict_scope: bool = True,
                  rag_refusal_message: str = "I can only answer questions based on the provided knowledge base."):
         self.mimi = mimi
@@ -671,10 +671,13 @@ def main():
              "RAGConfig.max_injection_tokens."
     )
     parser.add_argument(
-        "--rag-injection-reserve-frames", type=int, default=400,
+        "--rag-injection-reserve-frames", type=int, default=100,
         help="Frames left unused after injection, reserved for the live conversation that "
-             "follows (default 400 @ 12.5Hz ~= 32s). Only consulted when "
-             "--rag-max-injection-tokens is unset. See RAGConfig.injection_reserve_frames."
+             "follows (default 100 @ 12.5Hz ~= 8s). Keep this small -- a larger reserve directly "
+             "trades off how much of your knowledge base actually fits the injection budget; see "
+             "RAGConfig.injection_reserve_frames's docstring for a real measured example of this "
+             "causing dropped (unanswerable) topics. Only consulted when "
+             "--rag-max-injection-tokens is unset."
     )
     parser.add_argument(
         "--rag-score-threshold", type=float, default=None,

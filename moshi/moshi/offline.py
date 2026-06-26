@@ -183,7 +183,7 @@ def run_inference(
     rag_dynamic_injection_top_k: int = 2,
     rag_full_kb_max_chunks: Optional[int] = None,
     rag_max_injection_tokens: Optional[int] = None,
-    rag_injection_reserve_frames: int = 400,
+    rag_injection_reserve_frames: int = 100,
     rag_score_threshold: Optional[float] = None,
     rag_strict_scope: bool = True,
     rag_refusal_message: str = "I can only answer questions based on the provided knowledge base.",
@@ -636,10 +636,13 @@ def main():
              "and --rag-injection-reserve-frames."
     )
     parser.add_argument(
-        "--rag-injection-reserve-frames", type=int, default=400,
+        "--rag-injection-reserve-frames", type=int, default=100,
         help="Frames left unused after injection, reserved for the conversation that follows "
-             "(default 400 @ 12.5Hz ~= 32s). Only consulted when --rag-max-injection-tokens is "
-             "unset. See RAGConfig.injection_reserve_frames."
+             "(default 100 @ 12.5Hz ~= 8s). Keep this small -- a larger reserve directly trades "
+             "off how much of your knowledge base actually fits the injection budget; see "
+             "RAGConfig.injection_reserve_frames's docstring for a real measured example of this "
+             "causing dropped (unanswerable) topics. Only consulted when "
+             "--rag-max-injection-tokens is unset."
     )
     parser.add_argument(
         "--rag-score-threshold", type=float, default=None,

@@ -122,9 +122,22 @@ class RAGConfig:
     # Frames deliberately left unused after injection, reserved for the live conversation that
     # follows (the same ring buffer keeps filling once opus_loop starts) -- injecting all the way
     # to 100% fill means the very next user utterance starts evicting the knowledge just injected.
-    # Default (400 frames @ 12.5Hz ≈ 32s) is a conservative reserve for a typical conversational
-    # turn; lower it for a tiny knowledge base where every chunk matters, raise it for long calls.
-    injection_reserve_frames: int = 400
+    #
+    # Default is 100 frames (~8s @ 12.5Hz), deliberately small. An earlier default of 400 frames
+    # (~32s) turned out to actively break correctness for knowledge bases sized close to the
+    # model's context window: measured directly against this project's ~12,264-character
+    # RobotBulls `text.txt` (21 chunks, ~2,400-2,550 tokens including the scope instruction, per
+    # both a BERT-wordpiece and a GPT-2-BPE tokenizer estimate -- see docs/PRODUCTION_RAG.md),
+    # subtracting 400 reserve frames from a 3000-frame context left too little budget to fit the
+    # WHOLE document, so `RAGSession._select_within_budget` silently dropped the lowest-ranked
+    # chunks -- whichever topics happened to score worst against the connection-start
+    # `default_query` (e.g. "BTC Bull"/"Solana Bull" in that real run), making the assistant
+    # unable to answer questions about exactly those topics even though they're in the document.
+    # Prefer a SMALL reserve and let as much of the knowledge base fit as possible; only raise
+    # this if you've confirmed (e.g. via the notebook's Section 12 verification cell) that your
+    # knowledge base comfortably fits already and you specifically need headroom for very long
+    # calls.
+    injection_reserve_frames: int = 100
 
     # ---- Scope enforcement (answer only from the knowledge base) -------------------------------
     # Without this, injecting retrieved facts (or nothing, when retrieval finds nothing relevant)
@@ -281,7 +294,7 @@ class RAGConfig:
             dynamic_injection_top_k=_get("DYNAMIC_INJECTION_TOP_K", 2, int),
             log_dir=_get("LOG_DIR", "rag_logs"),
             max_injection_tokens=_get("MAX_INJECTION_TOKENS", None, int),
-            injection_reserve_frames=_get("INJECTION_RESERVE_FRAMES", 400, int),
+            injection_reserve_frames=_get("INJECTION_RESERVE_FRAMES", 100, int),
             strict_scope=_get("STRICT_SCOPE", True, bool),
             refusal_message=_get(
                 "REFUSAL_MESSAGE", "I can only answer questions based on the provided knowledge base."

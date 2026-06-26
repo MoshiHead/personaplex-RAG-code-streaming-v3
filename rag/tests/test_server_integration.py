@@ -1175,6 +1175,32 @@ class TestRAGSessionTokenBudget(unittest.TestCase):
 
         self.assertEqual(result["retrieved_contexts"], ["first", "second", "third"])
 
+    def test_kept_chunks_use_ids_not_score_rank_to_restore_document_order(self):
+        # Regression test for the real bug (docs/PRODUCTION_RAG.md): real FAISS results come back
+        # from retrieve_context ALREADY sorted by descending score -- e.g. chunk 2 (doc position 2)
+        # scores highest, chunk 0 (doc position 0) scores lowest. The old fallback ("sort the kept
+        # subset by its position in the already-score-sorted *list*") just preserves score order
+        # under a different name; only sorting by the real document-position `ids` actually
+        # restores reading order.
+        config = RAGConfig(
+            enable_rag=True, injection_mode=InjectionMode.PERSONA_RAG,
+            injection_reserve_frames=0, log_dir=self.tmp_dir,
+        )
+        lm_gen = FakeLMGenWithCache(capacity=1000, frames_used=0)
+        retriever = FakeRetriever({
+            "query": "q",
+            # Already in score-descending order, as real retrieve_context returns -- doc position
+            # 2 ("third", id=2) ranked highest, doc position 0 ("first", id=0) ranked lowest.
+            "contexts": ["third", "first", "second"],
+            "scores": [0.9, 0.3, 0.6],
+            "ids": [2, 0, 1],
+        })
+        session, _ = _make_session(config, self.tmp_dir, retriever=retriever, lm_gen=lm_gen)
+
+        result = session.inject_persona_compatible_knowledge("q")
+
+        self.assertEqual(result["retrieved_contexts"], ["first", "second", "third"])
+
     def test_mode_d_prepare_truncates_to_budget(self):
         config = RAGConfig(
             enable_rag=True, injection_mode=InjectionMode.TURN_INJECTION, vad_enabled=True,

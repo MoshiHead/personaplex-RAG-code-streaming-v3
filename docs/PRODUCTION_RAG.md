@@ -340,3 +340,54 @@ New CLI flags (`moshi.server`/`moshi.offline`): `--rag-score-threshold`, `--rag-
 
 18 new unit tests cover both mechanisms across every injection mode, plus the config validation
 for an empty `refusal_message` with `strict_scope` enabled. 160 tests pass total.
+
+## 12. Fourth real-pod bug: in-document questions still answered incompletely after Section 11
+
+After Section 11's fix, out-of-scope questions correctly got declined -- but questions that ARE
+covered by `text.txt` were still sometimes unanswerable or answered from chunks that read like a
+relevance-shuffled jumble rather than the source document's own structure. Two more bugs,
+confirmed by direct measurement against the real RobotBulls knowledge base:
+
+1. **`injection_reserve_frames`'s default (400 frames) was large enough to actively drop
+   document content.** Measured directly: the full `text.txt` (21 chunks) needs ~2,400-2,550
+   tokens including the Section 11 scope instruction (cross-checked with two independent
+   tokenizers -- bge-small's BERT wordpiece gives 2,456 + 66 + 8 ≈ 2,530; GPT-2's BPE gives 2,371,
+   same ballpark) against a 3,000-frame model context. Subtracting a plausible persona+voice
+   prompt cost (~100-165 frames, computed from `LMModel.step_system_prompts`'s actual frame
+   accounting: 1 frame per voice-prompt audio frame + 2×6 silence frames + 1 frame per persona
+   text token) and then the 400-frame reserve left as little as ~2,435-2,500 tokens of budget --
+   *less* than the ~2,530 needed for the whole document. `RAGSession._select_within_budget`
+   correctly capped to that budget (doing exactly what it was built to do), but doing so dropped
+   the lowest-ranked chunks: in a real run with `RAG_DEFAULT_QUERY` set to a generic company
+   summary, the BTC Bull/ETH Bull/Solana Bull product chunks ranked lowest and were the ones cut
+   -- so questions about exactly those products went unanswered, even though they're in the
+   document. **Fix:** lowered the default to 100 frames (~8s) -- comfortably small enough that
+   the whole RobotBulls document now fits (verified: 0 chunks dropped, all 21 present) while
+   still leaving some headroom for the conversation that follows. See
+   `RAGConfig.injection_reserve_frames`'s docstring for the full numbers. This is a tradeoff, not
+   a magic fix: a knowledge base meaningfully larger than this one will still need either a
+   smaller reserve, a more targeted `RAG_DEFAULT_QUERY`, or accepting that the lowest-relevance
+   chunks won't fit -- there is no way around the model's fixed context size.
+
+2. **The kept subset, even when everything fit, was reassembled in similarity-score order, not
+   document order.** `Retriever.retrieve_context` returns FAISS top-k results already sorted by
+   descending similarity to the query -- confirmed directly: querying the generic
+   `RAG_DEFAULT_QUERY` against the real index returned the "RBT token" chunk first and the
+   "Solana Bull" chunk last, completely unrelated to their order in `text.txt`.
+   `_select_within_budget`'s "restore original order" step sorted the kept subset by its
+   *position in that already-score-sorted list* -- which doesn't restore document order at all
+   when the input wasn't in document order to begin with (it only happened to work in this
+   project's own unit tests, whose hand-written fixtures passed already-document-ordered
+   `contexts` with separately-varied `scores` -- not what real retrieval returns). **Fix:**
+   `Retriever.retrieve_context`/`retrieve_all` now also return `"ids"` (the vector store's
+   insertion-order integer ids, i.e. each chunk's real position in the source document --
+   `build_index_from_documents` adds chunks in document order, so id order IS document order).
+   `_select_within_budget` now sorts the kept subset by `ids` (falling back to list position only
+   when a caller's retriever doesn't supply them, e.g. test stand-ins) -- verified directly: the
+   same query that previously returned "RBT token, ..., Solana Bull" now reassembles into the
+   document's own paragraph order ("company overview, ..., milestones") end to end.
+
+2 new unit tests (plus updates to existing `retrieve_context`/`retrieve_all` shape assertions for
+the new `"ids"` key) cover both fixes, including a regression test using already-score-sorted
+input (mirroring real FAISS output) to prove document order is restored via `ids`, not list
+position. 162 tests pass total.

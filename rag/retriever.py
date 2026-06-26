@@ -77,13 +77,22 @@ class Retriever:
         metadata_filter: Optional[dict] = None,
     ) -> dict:
         """Phase 5 entry point. Returns:
-            {"query": query, "contexts": [text, ...], "scores": [float, ...]}
-        with `contexts`/`scores` empty (not an error) if no index is loaded or nothing matches --
-        callers (e.g. Mode B/C policy code) should treat an empty result as "nothing relevant
-        found" and fall back to the bare persona prompt, not crash.
+            {"query": query, "contexts": [text, ...], "scores": [float, ...], "ids": [int, ...]}
+        with `contexts`/`scores`/`ids` empty (not an error) if no index is loaded or nothing
+        matches -- callers (e.g. Mode B/C policy code) should treat an empty result as "nothing
+        relevant found" and fall back to the bare persona prompt, not crash.
+
+        `ids` are the vector store's insertion-order integer ids -- i.e. each chunk's position in
+        the original source document, since `build_index_from_documents` adds chunks in document
+        order (see `rag.build_index.load_documents_from_text_file`). FAISS top-k search returns
+        results ranked by descending similarity, NOT document order, so callers that want to
+        re-assemble a SUBSET of results back into coherent, sequential reading order (e.g.
+        `RAGSession._select_within_budget`, when not every retrieved chunk fits the injection
+        budget) need this to sort by -- sorting by score order alone would interleave unrelated
+        topics in a knowledge block meant to read as one coherent document excerpt.
         """
         if self._store is None or self._store.index.ntotal == 0:
-            return {"query": query, "contexts": [], "scores": []}
+            return {"query": query, "contexts": [], "scores": [], "ids": []}
 
         query_vector = self._embedder.encode_query(query)
         results = self._store.search(
@@ -93,6 +102,7 @@ class Retriever:
             "query": query,
             "contexts": [r.text for r in results],
             "scores": [r.score for r in results],
+            "ids": [r.id for r in results],
         }
 
     def retrieve_all(self, limit: Optional[int] = None) -> dict:
@@ -100,17 +110,19 @@ class Retriever:
         there is genuinely no query text to retrieve against (e.g. a live voice connection with no
         ASR and no explicit query supplied by the client -- see
         `rag.server_integration.RAGSession._retrieve_for_injection`). Same
-        `{"query", "contexts", "scores"}` shape as `retrieve_context`, with `query=None` and
+        `{"query", "contexts", "scores", "ids"}` shape as `retrieve_context`, with `query=None` and
         `scores` all `1.0` (no real similarity was computed, so the score is not meaningful as a
         ranking signal -- it's included only for shape-compatibility with logging/benchmark code
-        that expects a `scores` list).
+        that expects a `scores` list). `ids` are already in document order here (see
+        `retrieve_context`'s docstring) since `FaissVectorStore.get_all` returns them sorted by id.
         """
         if self._store is None or self._store.index.ntotal == 0:
-            return {"query": None, "contexts": [], "scores": []}
+            return {"query": None, "contexts": [], "scores": [], "ids": []}
 
         results = self._store.get_all(limit=limit)
         return {
             "query": None,
             "contexts": [r.text for r in results],
             "scores": [r.score for r in results],
+            "ids": [r.id for r in results],
         }

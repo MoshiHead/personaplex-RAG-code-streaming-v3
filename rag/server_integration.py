@@ -158,7 +158,7 @@ class RAGSession:
 
         budget = self._compute_injection_token_budget()
         contexts, scores, dropped = self._select_within_budget(
-            retrieval["contexts"], retrieval["scores"], budget
+            retrieval["contexts"], retrieval["scores"], budget, ids=retrieval.get("ids")
         )
         record.retrieved_contexts = contexts
         record.retrieved_scores = scores
@@ -201,13 +201,24 @@ class RAGSession:
         return max(capacity - used - self.config.injection_reserve_frames, 0)
 
     def _select_within_budget(
-        self, contexts: list, scores: list, budget_tokens: Optional[int]
+        self, contexts: list, scores: list, budget_tokens: Optional[int], ids: Optional[list] = None
     ) -> tuple[list, list, int]:
         """Greedily keeps the highest-scoring `contexts` whose combined token cost (measured by
         the connection's real tokenizer, via `TokenInjector.count_tokens`) fits within
         `budget_tokens`, then restores the kept subset to ORIGINAL document order (not score
         order) so the resulting knowledge block reads as coherent, sequential prose instead of a
         relevance-shuffled jumble. Returns `(kept_contexts, kept_scores, chunks_dropped)`.
+
+        `ids` should be `Retriever.retrieve_context`/`retrieve_all`'s `"ids"` list -- the vector
+        store's insertion-order ids, i.e. each chunk's actual position in the source document.
+        `retrieve_context`'s `contexts`/`scores` come back ranked by descending similarity, NOT
+        document order, so sorting the kept subset by list *position* (the old behavior, still
+        used as a fallback when `ids` is omitted, e.g. by test stand-ins) does not actually
+        restore document order for real retrieval results -- it just preserves whatever order
+        FAISS happened to rank them in. Sorting by `ids` instead fixes that: a knowledge block
+        assembled from a same-relevance-ranked top-k still reads start-to-end the way the source
+        document does, rather than interleaving unrelated topics by how well each one happened to
+        score against the (often generic, connection-start) query. See docs/PRODUCTION_RAG.md.
 
         `budget_tokens=None` means "no cap" -- returns `contexts`/`scores` unchanged. This is the
         ONE place every injection mode (B, C, D, E, F) funnels its candidate chunks through before
@@ -222,6 +233,7 @@ class RAGSession:
         if budget_tokens is None or not contexts:
             return contexts, scores, 0
 
+        order_keys = ids if ids is not None else list(range(len(contexts)))
         order = sorted(range(len(contexts)), key=lambda i: scores[i], reverse=True)
         kept_idx: list[int] = []
         total = 0
@@ -231,7 +243,7 @@ class RAGSession:
                 continue
             kept_idx.append(i)
             total += cost
-        kept_idx.sort()
+        kept_idx.sort(key=lambda i: order_keys[i])
         dropped = len(contexts) - len(kept_idx)
         return [contexts[i] for i in kept_idx], [scores[i] for i in kept_idx], dropped
 
@@ -427,7 +439,7 @@ class RAGSession:
 
         budget = self._compute_injection_token_budget()
         contexts, scores, dropped = self._select_within_budget(
-            retrieval["contexts"], retrieval["scores"], budget
+            retrieval["contexts"], retrieval["scores"], budget, ids=retrieval.get("ids")
         )
         record.retrieved_contexts = contexts
         record.retrieved_scores = scores
@@ -598,7 +610,7 @@ class RAGSession:
 
         budget = self._compute_injection_token_budget()
         contexts, scores, dropped = self._select_within_budget(
-            retrieval["contexts"], retrieval["scores"], budget
+            retrieval["contexts"], retrieval["scores"], budget, ids=retrieval.get("ids")
         )
         record.retrieved_contexts = contexts
         record.retrieved_scores = scores
