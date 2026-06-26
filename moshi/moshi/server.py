@@ -103,7 +103,9 @@ class ServerState:
                  rag_vad_enable: bool = False, rag_turn_injection_top_k: int = 2,
                  rag_dynamic_injection_interval_s: float = 30.0, rag_dynamic_injection_top_k: int = 2,
                  rag_default_query: str = "", rag_full_kb_max_chunks: int | None = None,
-                 rag_max_injection_tokens: int | None = None, rag_injection_reserve_frames: int = 400):
+                 rag_max_injection_tokens: int | None = None, rag_injection_reserve_frames: int = 400,
+                 rag_score_threshold: float | None = None, rag_strict_scope: bool = True,
+                 rag_refusal_message: str = "I can only answer questions based on the provided knowledge base."):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
@@ -173,6 +175,9 @@ class ServerState:
                 full_kb_max_chunks=rag_full_kb_max_chunks,
                 max_injection_tokens=rag_max_injection_tokens,
                 injection_reserve_frames=rag_injection_reserve_frames,
+                score_threshold=rag_score_threshold,
+                strict_scope=rag_strict_scope,
+                refusal_message=rag_refusal_message,
             )
             self.rag_session = RAGSession(
                 config=rag_config,
@@ -671,6 +676,28 @@ def main():
              "follows (default 400 @ 12.5Hz ~= 32s). Only consulted when "
              "--rag-max-injection-tokens is unset. See RAGConfig.injection_reserve_frames."
     )
+    parser.add_argument(
+        "--rag-score-threshold", type=float, default=None,
+        help="Similarity-score cutoff for the explicit-query retrieval path (a client-supplied "
+             "rag_query). Default (unset) applies no cutoff -- relies entirely on "
+             "--rag-strict-scope's instruction wording to make the model decline. Measure your "
+             "own knowledge base's score distribution before setting this: an aggressive cutoff "
+             "can false-decline a real, generically-phrased in-scope question. See "
+             "RAGConfig.score_threshold."
+    )
+    parser.add_argument(
+        "--rag-no-strict-scope", action="store_false", dest="rag_strict_scope", default=True,
+        help="Disable scope enforcement -- restores the old behavior of injecting retrieved "
+             "facts (or nothing) with no instruction restricting the model to them. Enabled "
+             "(--rag-strict-scope) by default. See RAGConfig.strict_scope."
+    )
+    parser.add_argument(
+        "--rag-refusal-message", type=str,
+        default="I can only answer questions based on the provided knowledge base.",
+        help="Exact phrase the model is told to fall back to for anything the knowledge base "
+             "doesn't cover. Only used when --rag-strict-scope is enabled (the default). See "
+             "RAGConfig.refusal_message."
+    )
 
     args = parser.parse_args()
     args.voice_prompt_dir = _get_voice_prompt_dir(
@@ -748,6 +775,9 @@ def main():
         rag_full_kb_max_chunks=args.rag_full_kb_max_chunks,
         rag_max_injection_tokens=args.rag_max_injection_tokens,
         rag_injection_reserve_frames=args.rag_injection_reserve_frames,
+        rag_score_threshold=args.rag_score_threshold,
+        rag_strict_scope=args.rag_strict_scope,
+        rag_refusal_message=args.rag_refusal_message,
     )
     logger.info("warming up the model")
     state.warmup()

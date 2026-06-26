@@ -289,3 +289,54 @@ specific to a document whose total size approaches the size of the model's own c
 the dilutive-merge failure against realistic paragraph text, plus a fake-RingKVCache stand-in
 (`FakeLMGenWithCache`) exercising the live token-budget computation end-to-end. 142 tests pass
 total.
+
+## 11. Scope enforcement: decline instead of hallucinating for out-of-scope questions
+
+Sections 8-10 fix retrieval and injection so the right facts reliably make it into the live
+model's context. None of that, by itself, stops the model from blending in its own pretrained
+knowledge for whatever the knowledge base *doesn't* cover -- injecting facts only ever adds
+context; it never tells the model not to fall back on what it already knows. Asking a RobotBulls
+deployment "What is the capital of France?" would retrieve and inject *some* chunks (FAISS always
+returns its nearest neighbors, however irrelevant) and the model, with no instruction otherwise,
+would happily answer from its own knowledge instead of recognizing the question is out of scope.
+
+**Fix: every injected knowledge block now carries an explicit scope instruction, and an explicit
+question that retrieval can't answer gets an explicit decline instruction instead of silence.**
+
+`RAGConfig.strict_scope` (default `True`) and `RAGConfig.refusal_message` (default a generic
+phrase; set this to something specific to your deployment, e.g. naming your company) drive two
+changes in `rag/server_integration.py`, applied uniformly across every injection mode (B/C/D/E/F):
+
+1. **`rag.injection_manager.build_scoped_knowledge_block`** wraps every retrieved knowledge block
+   with: *"You must answer ONLY using the information provided below... If the user's question is
+   not covered by this information, respond only with: \"<refusal_message>\""* -- this is what
+   makes the model decline rather than blend in its own knowledge for a question the knowledge
+   base doesn't cover, even when (per the architecture's no-ASR constraint -- Section 3) the model
+   was never told what the user's specific question was going to be.
+2. **`rag.injection_manager.build_out_of_scope_notice`** is injected INSTEAD of nothing whenever
+   retrieval comes back completely empty for an explicit query (a `rag_query`/`--rag-query` that
+   scored below `score_threshold` against every indexed chunk) or the knowledge base itself has no
+   documents. Previously, this case (`_retrieve_for_injection` returning no contexts) caused the
+   caller to skip injection entirely, silently leaving the model with no grounding and no
+   instruction at all for that call -- exactly free to answer from its own knowledge. Now it
+   injects an explicit "this question isn't covered, decline" instruction instead.
+
+`score_threshold` (`RAGConfig.score_threshold`, default `None`) is a SEPARATE, optional knob that
+hard-gates the explicit-query path (#2 above) before injection even happens. It is deliberately
+NOT given an aggressive default: measured directly against this project's RobotBulls
+`text.txt`/`bge-small` combination, clearly off-topic questions ("What's the capital of France?")
+scored ~0.42-0.56 cosine similarity, while genuine but generically-phrased in-scope questions
+("How can I contact support?") scored as low as ~0.51 -- the two ranges OVERLAP, so any cutoff
+aggressive enough to reliably block off-topic questions will also occasionally false-decline a
+real, in-scope one. Mechanism #1 (the always-on instruction wrapper) is the primary, more reliable
+defense for exactly this reason: it lets the model itself judge whether the retrieved facts
+actually answer the question, rather than a single similarity number pre-deciding that with no
+visibility into what was actually asked. Set `score_threshold` only after measuring your own
+knowledge base's score distribution the same way (see the notebook's Section 12 verification
+cell, which now prints both in-scope and out-of-scope sample scores for exactly this purpose).
+
+New CLI flags (`moshi.server`/`moshi.offline`): `--rag-score-threshold`, `--rag-no-strict-scope`
+(disables scope enforcement, restoring the pre-Section-11 behavior), `--rag-refusal-message`.
+
+18 new unit tests cover both mechanisms across every injection mode, plus the config validation
+for an empty `refusal_message` with `strict_scope` enabled. 160 tests pass total.

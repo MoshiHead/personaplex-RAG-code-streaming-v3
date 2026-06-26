@@ -62,6 +62,20 @@ class TestRAGConfigDefaults(unittest.TestCase):
         warnings = RAGConfig(injection_reserve_frames=-1).validate()
         self.assertTrue(any("injection_reserve_frames" in w for w in warnings))
 
+    def test_strict_scope_defaults_to_enabled_with_a_nonempty_refusal_message(self):
+        cfg = RAGConfig()
+        self.assertTrue(cfg.strict_scope)
+        self.assertTrue(cfg.refusal_message.strip())
+        self.assertEqual(cfg.validate(), [])
+
+    def test_strict_scope_with_empty_refusal_message_warns(self):
+        warnings = RAGConfig(strict_scope=True, refusal_message="").validate()
+        self.assertTrue(any("refusal_message" in w for w in warnings))
+
+    def test_strict_scope_disabled_with_empty_refusal_message_is_clean(self):
+        # Only a problem if strict_scope is actually going to use refusal_message.
+        self.assertEqual(RAGConfig(strict_scope=False, refusal_message="").validate(), [])
+
     def test_invalid_dynamic_injection_top_k_warns(self):
         cfg = RAGConfig(dynamic_injection_top_k=0)
         warnings = cfg.validate()
@@ -93,6 +107,8 @@ class TestRAGConfigFromEnv(unittest.TestCase):
         "PERSONAPLEX_RAG_VAD_ENABLED",
         "PERSONAPLEX_RAG_MAX_INJECTION_TOKENS",
         "PERSONAPLEX_RAG_INJECTION_RESERVE_FRAMES",
+        "PERSONAPLEX_RAG_STRICT_SCOPE",
+        "PERSONAPLEX_RAG_REFUSAL_MESSAGE",
     ]
 
     def tearDown(self):
@@ -124,6 +140,15 @@ class TestRAGConfigFromEnv(unittest.TestCase):
 
         self.assertEqual(cfg.max_injection_tokens, 1500)
         self.assertEqual(cfg.injection_reserve_frames, 100)
+
+    def test_from_env_reads_strict_scope_overrides(self):
+        os.environ["PERSONAPLEX_RAG_STRICT_SCOPE"] = "false"
+        os.environ["PERSONAPLEX_RAG_REFUSAL_MESSAGE"] = "Sorry, that's outside my documentation."
+
+        cfg = RAGConfig.from_env()
+
+        self.assertFalse(cfg.strict_scope)
+        self.assertEqual(cfg.refusal_message, "Sorry, that's outside my documentation.")
 
 
 if __name__ == "__main__":

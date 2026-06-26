@@ -136,12 +136,29 @@ class TestRAGSessionModeC(unittest.TestCase):
         self.assertIn("skipped", result["injection_strategy"])
         self.assertEqual(len(lm_gen.calls), 0)
 
-    def test_empty_retrieval_result_skips_injection(self):
+    def test_empty_retrieval_result_skips_injection_when_strict_scope_is_disabled(self):
+        config = RAGConfig(
+            enable_rag=True, injection_mode=InjectionMode.PERSONA_RAG, strict_scope=False, log_dir=self.tmp_dir,
+        )
         retriever = FakeRetriever({"query": "q", "contexts": [], "scores": []})
-        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        session, lm_gen = _make_session(config, self.tmp_dir, retriever=retriever)
         result = session.inject_persona_compatible_knowledge("What is the deposit?")
         self.assertIn("skipped (no contexts", result["injection_strategy"])
         self.assertEqual(len(lm_gen.calls), 0)
+
+    def test_empty_retrieval_result_injects_a_decline_notice_by_default(self):
+        # strict_scope defaults to True: a question the knowledge base doesn't cover must not be
+        # silently skipped (which would leave the model free to answer from its own pretrained
+        # knowledge) -- it must inject an explicit instruction to decline.
+        retriever = FakeRetriever({"query": "q", "contexts": [], "scores": []})
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        result = session.inject_persona_compatible_knowledge("What is the capital of France?")
+
+        self.assertIn("out-of-scope decline notice", result["injection_strategy"])
+        self.assertGreater(len(lm_gen.calls), 0)
+        forced_text = "".join(chr(c["text_token"]) for c in lm_gen.calls)
+        self.assertIn(self.config.refusal_message, forced_text)
+        self.assertIn("What is the capital of France?", forced_text)
 
     def test_successful_retrieval_forces_tokens_through_lm_gen(self):
         retriever = FakeRetriever(
@@ -225,7 +242,22 @@ class TestRAGSessionModeC(unittest.TestCase):
         self.assertEqual(retriever.retrieve_all_calls, 1)
         self.assertGreater(len(lm_gen.calls), 0)
 
-    def test_empty_kb_with_no_query_skips_injection_with_a_clear_reason(self):
+    def test_empty_kb_with_no_query_skips_injection_with_a_clear_reason_when_strict_scope_is_disabled(self):
+        config = RAGConfig(
+            enable_rag=True, injection_mode=InjectionMode.PERSONA_RAG, strict_scope=False, log_dir=self.tmp_dir,
+        )
+        retriever = FakeRetriever(
+            {"query": "q", "contexts": ["fact A"], "scores": [0.9]},
+            all_result={"query": None, "contexts": [], "scores": []},
+        )
+        session, lm_gen = _make_session(config, self.tmp_dir, retriever=retriever)
+
+        result = session.inject_persona_compatible_knowledge("")
+
+        self.assertEqual(result["injection_strategy"], "skipped (no documents in the index)")
+        self.assertEqual(len(lm_gen.calls), 0)
+
+    def test_empty_kb_with_no_query_injects_a_decline_notice_by_default(self):
         retriever = FakeRetriever(
             {"query": "q", "contexts": ["fact A"], "scores": [0.9]},
             all_result={"query": None, "contexts": [], "scores": []},
@@ -234,8 +266,10 @@ class TestRAGSessionModeC(unittest.TestCase):
 
         result = session.inject_persona_compatible_knowledge("")
 
-        self.assertEqual(result["injection_strategy"], "skipped (no documents in the index)")
-        self.assertEqual(len(lm_gen.calls), 0)
+        self.assertIn("out-of-scope decline notice", result["injection_strategy"])
+        self.assertGreater(len(lm_gen.calls), 0)
+        forced_text = "".join(chr(c["text_token"]) for c in lm_gen.calls)
+        self.assertIn(self.config.refusal_message, forced_text)
 
     def test_inject_does_not_write_to_the_log_until_finalized(self):
         retriever = FakeRetriever({"query": "q", "contexts": ["fact one"], "scores": [0.8]})
@@ -322,18 +356,38 @@ class TestRAGSessionModeB(unittest.TestCase):
         self.assertIn("skipped", result["injection_strategy"])
         self.assertEqual(len(lm_gen.calls), 0)
 
-    def test_empty_retrieval_result_skips_injection(self):
+    def test_empty_retrieval_result_skips_injection_when_strict_scope_is_disabled(self):
+        config = RAGConfig(
+            enable_rag=True, injection_mode=InjectionMode.PROMPT_RAG, strict_scope=False, log_dir=self.tmp_dir,
+        )
         retriever = FakeRetriever({"query": "q", "contexts": [], "scores": []})
-        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        session, lm_gen = _make_session(config, self.tmp_dir, retriever=retriever)
         result = session.inject_standard_prompt_rag("What is the deposit?")
         self.assertIn("skipped (no contexts", result["injection_strategy"])
         self.assertEqual(len(lm_gen.calls), 0)
 
-    def test_injected_text_matches_the_naive_template_exactly(self):
+    def test_empty_retrieval_result_injects_a_decline_notice_by_default(self):
+        # strict_scope defaults to True: an unanswerable question must not be silently skipped
+        # (which would leave the model free to answer from its own pretrained knowledge) -- it
+        # must inject an explicit instruction to decline.
+        retriever = FakeRetriever({"query": "q", "contexts": [], "scores": []})
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        result = session.inject_standard_prompt_rag("What is the capital of France?")
+
+        self.assertIn("out-of-scope decline notice", result["injection_strategy"])
+        self.assertGreater(len(lm_gen.calls), 0)
+        forced_text = "".join(chr(c["text_token"]) for c in lm_gen.calls)
+        self.assertIn(self.config.refusal_message, forced_text)
+        self.assertIn("What is the capital of France?", forced_text)
+
+    def test_injected_text_matches_the_naive_template_exactly_with_strict_scope_disabled(self):
+        config = RAGConfig(
+            enable_rag=True, injection_mode=InjectionMode.PROMPT_RAG, strict_scope=False, log_dir=self.tmp_dir,
+        )
         retriever = FakeRetriever(
             {"query": "q", "contexts": ["A $300 deposit is required."], "scores": [0.92]}
         )
-        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+        session, lm_gen = _make_session(config, self.tmp_dir, retriever=retriever)
 
         session.inject_standard_prompt_rag("How much is the deposit?")
 
@@ -344,6 +398,18 @@ class TestRAGSessionModeB(unittest.TestCase):
             "Use the knowledge above when answering."
         )
         self.assertEqual(forced_text, expected)
+
+    def test_naive_template_includes_the_scope_clause_by_default(self):
+        retriever = FakeRetriever(
+            {"query": "q", "contexts": ["A $300 deposit is required."], "scores": [0.92]}
+        )
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+
+        session.inject_standard_prompt_rag("How much is the deposit?")
+
+        forced_text = "".join(chr(c["text_token"]) for c in lm_gen.calls)
+        self.assertIn("A $300 deposit is required.", forced_text)
+        self.assertIn(self.config.refusal_message, forced_text)
 
     def test_naive_template_is_not_wrapped_in_system_tags(self):
         retriever = FakeRetriever({"query": "q", "contexts": ["fact"], "scores": [0.9]})
@@ -509,6 +575,22 @@ class TestRAGSessionModeD(unittest.TestCase):
 
         self.assertEqual(seen_top_k, [2])
 
+    def test_prepare_arms_an_out_of_scope_notice_when_nothing_relevant_found(self):
+        # strict_scope defaults to True: when nothing is found, the turn-boundary burst must still
+        # fire something -- a decline instruction -- rather than leaving the model with no
+        # instruction at all and free to answer from its own knowledge on every detected pause.
+        retriever = FakeRetriever({"query": "q", "contexts": [], "scores": []})
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+
+        record = session.prepare_turn_injection_knowledge("What's the weather like?")
+        self.assertIn("out-of-scope decline notice", record["injection_strategy"])
+        self.assertIsNotNone(session._turn_injection_request)
+
+        result = session.fire_turn_injection_burst()
+        self.assertGreater(len(lm_gen.calls), 0)
+        forced_text = "".join(chr(c["text_token"]) for c in lm_gen.calls)
+        self.assertIn(self.config.refusal_message, forced_text)
+
     def test_fire_turn_injection_burst_forces_all_tokens_and_logs_one_row(self):
         retriever = FakeRetriever({"query": "q", "contexts": ["ab"], "scores": [0.9]})
         session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
@@ -665,6 +747,20 @@ class TestRAGSessionModeE(unittest.TestCase):
 
         self.assertEqual(seen_top_k, [2])
 
+    def test_prepare_arms_an_out_of_scope_notice_when_nothing_relevant_found(self):
+        retriever = FakeRetriever({"query": "q", "contexts": [], "scores": []})
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+
+        record = session.prepare_dynamic_injection_knowledge("What's the weather like?")
+        self.assertIn("out-of-scope decline notice", record["injection_strategy"])
+        self.assertIsNotNone(session._dynamic_injection_request)
+
+        session.fire_dynamic_injection_burst()
+        self.assertGreater(len(lm_gen.calls), 0)
+        forced_text = "".join(chr(c["text_token"]) for c in lm_gen.calls)
+        self.assertIn(self.config.refusal_message, forced_text)
+        self.assertNotIn("<system>", forced_text)
+
     def test_fire_dynamic_injection_burst_forces_tokens_without_system_wrapping(self):
         retriever = FakeRetriever({"query": "q", "contexts": ["ab"], "scores": [0.9]})
         session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
@@ -682,7 +778,7 @@ class TestRAGSessionModeE(unittest.TestCase):
 
         forced_text = "".join(chr(c["text_token"]) for c in lm_gen.calls)
         self.assertNotIn("<system>", forced_text)
-        self.assertEqual(forced_text, "ab")
+        self.assertIn("ab", forced_text)  # the retrieved fact, plus strict_scope's instruction text
 
         rows = session.logger.read_all()
         burst_rows = [r for r in rows if r["injection_strategy"].startswith("dynamic_runtime (burst")]
@@ -783,6 +879,17 @@ class TestRAGSessionModeF(unittest.TestCase):
         self.assertFalse(lm_gen.reset_streaming_called)
         forced_text = "".join(chr(c["text_token"]) for c in lm_gen.calls)
         self.assertTrue(forced_text.startswith("<system>"))
+
+    def test_fire_cache_aware_burst_injects_an_out_of_scope_notice_when_nothing_relevant_found(self):
+        retriever = FakeRetriever({"query": "q", "contexts": [], "scores": []})
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+
+        result = session.fire_cache_aware_burst("What's the weather like?")
+
+        self.assertIn("out-of-scope decline notice", result["injection_strategy"])
+        self.assertGreater(len(lm_gen.calls), 0)
+        forced_text = "".join(chr(c["text_token"]) for c in lm_gen.calls)
+        self.assertIn(self.config.refusal_message, forced_text)
 
     def test_fire_cache_aware_burst_does_not_write_to_the_log_until_finalized(self):
         retriever = FakeRetriever({"query": "q", "contexts": ["fact"], "scores": [0.9]})

@@ -126,6 +126,28 @@ class RAGConfig:
     # turn; lower it for a tiny knowledge base where every chunk matters, raise it for long calls.
     injection_reserve_frames: int = 400
 
+    # ---- Scope enforcement (answer only from the knowledge base) -------------------------------
+    # Without this, injecting retrieved facts (or nothing, when retrieval finds nothing relevant)
+    # only ever *adds* context -- it never tells the model NOT to fall back on its own pretrained
+    # knowledge, so a question the knowledge base doesn't cover gets answered anyway, from
+    # whatever the model already knows. `strict_scope=True` (the default) fixes this two ways:
+    #   1. Every injected knowledge block is wrapped with an explicit "answer ONLY from this"
+    #      instruction (see `rag.injection_manager.build_scoped_knowledge_block`).
+    #   2. When retrieval finds nothing relevant (an explicit query scored below
+    #      `score_threshold` against every chunk, or the knowledge base is empty), an explicit
+    #      decline instruction is injected INSTEAD of silently injecting nothing -- the previous
+    #      behavior left the model with no instruction at all for that case, free to answer from
+    #      its own knowledge. Set to `False` to restore the old "just inject whatever was
+    #      retrieved, or nothing" behavior (e.g. for Mode B's negative-control benchmark, which
+    #      intentionally compares grounding quality with and without explicit scope wording).
+    strict_scope: bool = True
+
+    # Exact phrase the model should fall back to for anything the knowledge base doesn't cover.
+    # Keep this short and unambiguous -- it is quoted verbatim in the instruction text the model
+    # is told to repeat back, not paraphrased. Set this to something specific to your deployment
+    # (e.g. naming your company/product) for a more natural-sounding decline.
+    refusal_message: str = "I can only answer questions based on the provided knowledge base."
+
     # Where per-request logs (Phase 9) and benchmark reports (Phase 8) get written.
     log_dir: str = "rag_logs"
 
@@ -210,6 +232,13 @@ class RAGConfig:
                 f"injection_reserve_frames should be >= 0, got {self.injection_reserve_frames}."
             )
 
+        if self.strict_scope and not self.refusal_message.strip():
+            warnings.append(
+                "strict_scope is True but refusal_message is empty -- the model would be told to "
+                "respond with an empty string for out-of-scope questions. Set REFUSAL_MESSAGE to "
+                "a real phrase."
+            )
+
         return warnings
 
     def as_dict(self) -> dict:
@@ -253,4 +282,8 @@ class RAGConfig:
             log_dir=_get("LOG_DIR", "rag_logs"),
             max_injection_tokens=_get("MAX_INJECTION_TOKENS", None, int),
             injection_reserve_frames=_get("INJECTION_RESERVE_FRAMES", 400, int),
+            strict_scope=_get("STRICT_SCOPE", True, bool),
+            refusal_message=_get(
+                "REFUSAL_MESSAGE", "I can only answer questions based on the provided knowledge base."
+            ),
         )

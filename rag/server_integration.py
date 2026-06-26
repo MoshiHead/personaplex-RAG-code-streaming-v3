@@ -18,7 +18,14 @@ import time
 from typing import Any, Optional
 
 from .config import InjectionMode, RAGConfig
-from .injection_manager import InjectionJob, InjectionRequest, TokenInjector, wrap_with_system_tags
+from .injection_manager import (
+    InjectionJob,
+    InjectionRequest,
+    TokenInjector,
+    build_out_of_scope_notice,
+    build_scoped_knowledge_block,
+    wrap_with_system_tags,
+)
 from .logging_utils import RequestLogger, RequestLogRecord, inspect_kv_cache
 from .retriever import Retriever
 from .turn_detector import TurnBoundaryDetector
@@ -88,10 +95,16 @@ class RAGSession:
     # ---- Shared retrieval step for any connection-start mode (B or C) -----------------------
     def _retrieve_for_injection(self, query: Optional[str], mode: str) -> tuple[RequestLogRecord, Optional[dict]]:
         """Runs retrieval and builds the common prefix of a log record for any connection-start
-        injection mode. Returns `(record, None)` if the caller should stop immediately (RAG
-        disabled, no index, or nothing retrieved above `score_threshold`) -- `record` already
-        explains why via `injection_strategy`. Returns `(record, retrieval_dict)` otherwise, where
-        `retrieval_dict` is `Retriever.retrieve_context`'s `{"query", "contexts", "scores"}`.
+        injection mode. Returns `(record, None)` only if the caller should stop immediately and
+        inject nothing at all -- RAG disabled / no index loaded, which `record.injection_strategy`
+        already explains. Returns `(record, retrieval_dict)` otherwise, where `retrieval_dict` is
+        `Retriever.retrieve_context`'s `{"query", "contexts", "scores"}` -- note that
+        `retrieval_dict["contexts"]` may be EMPTY (nothing scored above `score_threshold`, or the
+        knowledge base itself has no documents): callers must check for that and, when
+        `config.strict_scope` is set, inject an explicit decline instruction
+        (`build_out_of_scope_notice`) instead of treating an empty result the same as "stop
+        immediately." This is what makes the assistant decline an out-of-scope question instead
+        of silently falling back to its own pretrained knowledge (see docs/PRODUCTION_RAG.md).
 
         Both Mode B and Mode C retrieve identically -- the *only* thing that should differ between
         them is how the retrieved text gets formatted before injection. Sharing this step is what
@@ -133,11 +146,15 @@ class RAGSession:
         if not retrieval["contexts"]:
             record.retrieved_contexts = retrieval["contexts"]
             record.retrieved_scores = retrieval["scores"]
-            record.injection_strategy = (
-                "skipped (no contexts above score_threshold)" if query
-                else "skipped (no documents in the index)"
-            )
-            return record, None
+            if not self.config.strict_scope:
+                record.injection_strategy = (
+                    "skipped (no contexts above score_threshold)" if query
+                    else "skipped (no documents in the index)"
+                )
+                return record, None
+            # strict_scope: return the EMPTY retrieval dict (not None) -- the caller must inject
+            # an explicit decline instruction for this, not skip injection silently.
+            return record, retrieval
 
         budget = self._compute_injection_token_budget()
         contexts, scores, dropped = self._select_within_budget(
@@ -150,8 +167,10 @@ class RAGSession:
         retrieval = {"query": retrieval["query"], "contexts": contexts, "scores": scores}
 
         if not retrieval["contexts"]:
-            record.injection_strategy = "skipped (token budget too small to fit any retrieved chunk)"
-            return record, None
+            if not self.config.strict_scope:
+                record.injection_strategy = "skipped (token budget too small to fit any retrieved chunk)"
+                return record, None
+            return record, retrieval
 
         return record, retrieval
 
@@ -216,6 +235,22 @@ class RAGSession:
         dropped = len(contexts) - len(kept_idx)
         return [contexts[i] for i in kept_idx], [scores[i] for i in kept_idx], dropped
 
+    def _build_injection_text(self, retrieval: dict, query: Optional[str]) -> tuple[str, bool]:
+        """Builds the text to inject for any mode that reuses `_retrieve_for_injection` (B, C, F):
+        the scoped knowledge block when something relevant was found, or an explicit
+        out-of-scope decline notice when retrieval came back empty -- which only happens when
+        `config.strict_scope` is True (`_retrieve_for_injection` returns `None` instead of an
+        empty dict otherwise; see its docstring). Returns `(text, found_relevant_context)` so
+        callers can pick an accurate `injection_strategy` label."""
+        if retrieval["contexts"]:
+            knowledge_block = "\n".join(retrieval["contexts"])
+            text = (
+                build_scoped_knowledge_block(knowledge_block, self.config.refusal_message)
+                if self.config.strict_scope else knowledge_block
+            )
+            return text, True
+        return build_out_of_scope_notice(self.config.refusal_message, query), False
+
     def _run_injection(
         self, record: RequestLogRecord, request: InjectionRequest, strategy_label: str,
         prompt_text: str, context_text: str,
@@ -266,15 +301,20 @@ class RAGSession:
         if retrieval is None:
             return record.to_dict()
 
-        knowledge_block = "\n".join(retrieval["contexts"])
+        injection_text, found = self._build_injection_text(retrieval, query)
+        strategy_label = (
+            "persona_rag (blocking burst, same <system> mechanism as persona prompt)" if found
+            else "persona_rag (out-of-scope decline notice -- no relevant knowledge found)"
+        )
+
         request = InjectionRequest(
-            text=knowledge_block, mode=InjectionMode.PERSONA_RAG.value, wrap_system_tags=True
+            text=injection_text, mode=InjectionMode.PERSONA_RAG.value, wrap_system_tags=True
         )
         self._run_injection(
             record, request,
-            strategy_label="persona_rag (blocking burst, same <system> mechanism as persona prompt)",
-            prompt_text=wrap_with_system_tags(knowledge_block),
-            context_text=knowledge_block,
+            strategy_label=strategy_label,
+            prompt_text=wrap_with_system_tags(injection_text),
+            context_text=injection_text,
         )
         return record.to_dict()
 
@@ -308,18 +348,29 @@ class RAGSession:
         if retrieval is None:
             return record.to_dict()
 
-        knowledge_block = "\n".join(retrieval["contexts"])
-        naive_prompt = (
-            f"Relevant Knowledge:\n{knowledge_block}\n\n"
-            f"User Question:\n{query or '(not specified)'}\n\n"
-            "Use the knowledge above when answering."
-        )
+        if retrieval["contexts"]:
+            knowledge_block = "\n".join(retrieval["contexts"])
+            scope_clause = (
+                f' If this knowledge does not cover the question, respond only with: '
+                f'"{self.config.refusal_message}"' if self.config.strict_scope else ""
+            )
+            naive_prompt = (
+                f"Relevant Knowledge:\n{knowledge_block}\n\n"
+                f"User Question:\n{query or '(not specified)'}\n\n"
+                f"Use the knowledge above when answering.{scope_clause}"
+            )
+            strategy_label = "prompt_rag (naive 'Relevant Knowledge' block, no <system> wrapping -- negative control)"
+        else:
+            knowledge_block = ""
+            naive_prompt = build_out_of_scope_notice(self.config.refusal_message, query)
+            strategy_label = "prompt_rag (out-of-scope decline notice -- no relevant knowledge found)"
+
         request = InjectionRequest(
             text=naive_prompt, mode=InjectionMode.PROMPT_RAG.value, wrap_system_tags=False
         )
         self._run_injection(
             record, request,
-            strategy_label="prompt_rag (naive 'Relevant Knowledge' block, no <system> wrapping -- negative control)",
+            strategy_label=strategy_label,
             prompt_text=naive_prompt,
             context_text=knowledge_block,
         )
@@ -369,8 +420,10 @@ class RAGSession:
         if not retrieval["contexts"]:
             record.retrieved_contexts = retrieval["contexts"]
             record.retrieved_scores = retrieval["scores"]
-            record.injection_strategy = "skipped (no contexts above score_threshold at turn_injection_top_k)"
-            return record.to_dict()
+            if not self.config.strict_scope:
+                record.injection_strategy = "skipped (no contexts above score_threshold at turn_injection_top_k)"
+                return record.to_dict()
+            return self._prepare_out_of_scope_turn_injection(record, query)
 
         budget = self._compute_injection_token_budget()
         contexts, scores, dropped = self._select_within_budget(
@@ -381,19 +434,45 @@ class RAGSession:
         record.injection_token_budget = budget
         record.chunks_dropped_for_budget = dropped
         if not contexts:
-            record.injection_strategy = "skipped (token budget too small to fit any retrieved chunk)"
-            return record.to_dict()
+            if not self.config.strict_scope:
+                record.injection_strategy = "skipped (token budget too small to fit any retrieved chunk)"
+                return record.to_dict()
+            return self._prepare_out_of_scope_turn_injection(record, query)
 
         knowledge_block = "\n".join(contexts)
+        injection_text = (
+            build_scoped_knowledge_block(knowledge_block, self.config.refusal_message)
+            if self.config.strict_scope else knowledge_block
+        )
         self._turn_injection_request = InjectionRequest(
-            text=knowledge_block, mode=InjectionMode.TURN_INJECTION.value, wrap_system_tags=True
+            text=injection_text, mode=InjectionMode.TURN_INJECTION.value, wrap_system_tags=True
         )
         self._turn_injection_query = query
         record.injection_strategy = (
             "turn_injection (prepared; fired as a burst on each detected turn boundary)"
         )
-        record.context_length_chars = len(knowledge_block)
-        record.prompt_length_chars = len(wrap_with_system_tags(knowledge_block))
+        record.context_length_chars = len(injection_text)
+        record.prompt_length_chars = len(wrap_with_system_tags(injection_text))
+        return record.to_dict()
+
+    def _prepare_out_of_scope_turn_injection(self, record: RequestLogRecord, query: str) -> dict:
+        """Shared by `prepare_turn_injection_knowledge` for both "nothing scored above
+        score_threshold" and "token budget too small to fit any retrieved chunk" -- either way,
+        nothing relevant was found, so arm an explicit decline notice (instead of leaving
+        `_turn_injection_request` unset, which would silently never fire any instruction at all)
+        so every detected turn boundary reinforces declining rather than answering from the
+        model's own knowledge."""
+        notice = build_out_of_scope_notice(self.config.refusal_message, query)
+        self._turn_injection_request = InjectionRequest(
+            text=notice, mode=InjectionMode.TURN_INJECTION.value, wrap_system_tags=True
+        )
+        self._turn_injection_query = query
+        record.injection_strategy = (
+            "turn_injection (prepared out-of-scope decline notice; fired as a burst on each "
+            "detected turn boundary)"
+        )
+        record.context_length_chars = len(notice)
+        record.prompt_length_chars = len(wrap_with_system_tags(notice))
         return record.to_dict()
 
     def observe_user_frame(self, pcm_frame) -> bool:
@@ -512,8 +591,10 @@ class RAGSession:
         if not retrieval["contexts"]:
             record.retrieved_contexts = retrieval["contexts"]
             record.retrieved_scores = retrieval["scores"]
-            record.injection_strategy = "skipped (no contexts above score_threshold at dynamic_injection_top_k)"
-            return record.to_dict()
+            if not self.config.strict_scope:
+                record.injection_strategy = "skipped (no contexts above score_threshold at dynamic_injection_top_k)"
+                return record.to_dict()
+            return self._prepare_out_of_scope_dynamic_injection(record, query)
 
         budget = self._compute_injection_token_budget()
         contexts, scores, dropped = self._select_within_budget(
@@ -524,12 +605,18 @@ class RAGSession:
         record.injection_token_budget = budget
         record.chunks_dropped_for_budget = dropped
         if not contexts:
-            record.injection_strategy = "skipped (token budget too small to fit any retrieved chunk)"
-            return record.to_dict()
+            if not self.config.strict_scope:
+                record.injection_strategy = "skipped (token budget too small to fit any retrieved chunk)"
+                return record.to_dict()
+            return self._prepare_out_of_scope_dynamic_injection(record, query)
 
         knowledge_block = "\n".join(contexts)
+        injection_text = (
+            build_scoped_knowledge_block(knowledge_block, self.config.refusal_message)
+            if self.config.strict_scope else knowledge_block
+        )
         self._dynamic_injection_request = InjectionRequest(
-            text=knowledge_block, mode=InjectionMode.DYNAMIC_RUNTIME.value, wrap_system_tags=False
+            text=injection_text, mode=InjectionMode.DYNAMIC_RUNTIME.value, wrap_system_tags=False
         )
         self._dynamic_injection_query = query
         self._dynamic_injection_last_fire_time = time.monotonic()
@@ -537,8 +624,27 @@ class RAGSession:
             "dynamic_runtime (prepared, no <system> wrapping; re-fired as a burst every "
             f"{self.config.dynamic_injection_interval_s}s)"
         )
-        record.context_length_chars = len(knowledge_block)
-        record.prompt_length_chars = len(knowledge_block)  # no wrapping added for this mode
+        record.context_length_chars = len(injection_text)
+        record.prompt_length_chars = len(injection_text)  # no wrapping added for this mode
+        return record.to_dict()
+
+    def _prepare_out_of_scope_dynamic_injection(self, record: RequestLogRecord, query: str) -> dict:
+        """Shared by `prepare_dynamic_injection_knowledge` for both "nothing scored above
+        score_threshold" and "token budget too small to fit any retrieved chunk" -- see
+        `_prepare_out_of_scope_turn_injection`'s docstring for why this is needed instead of
+        leaving `_dynamic_injection_request` unset."""
+        notice = build_out_of_scope_notice(self.config.refusal_message, query)
+        self._dynamic_injection_request = InjectionRequest(
+            text=notice, mode=InjectionMode.DYNAMIC_RUNTIME.value, wrap_system_tags=False
+        )
+        self._dynamic_injection_query = query
+        self._dynamic_injection_last_fire_time = time.monotonic()
+        record.injection_strategy = (
+            "dynamic_runtime (prepared out-of-scope decline notice, no <system> wrapping; "
+            f"re-fired as a burst every {self.config.dynamic_injection_interval_s}s)"
+        )
+        record.context_length_chars = len(notice)
+        record.prompt_length_chars = len(notice)
         return record.to_dict()
 
     def tick_dynamic_injection(self) -> bool:
@@ -600,15 +706,19 @@ class RAGSession:
         if retrieval is None:
             return record.to_dict()
 
-        knowledge_block = "\n".join(retrieval["contexts"])
+        injection_text, found = self._build_injection_text(retrieval, query)
+        strategy_label = (
+            "cache_aware (burst, no reset -- preserves the live RingKVCache)" if found
+            else "cache_aware (out-of-scope decline notice -- no relevant knowledge found)"
+        )
         request = InjectionRequest(
-            text=knowledge_block, mode=InjectionMode.CACHE_AWARE.value, wrap_system_tags=True
+            text=injection_text, mode=InjectionMode.CACHE_AWARE.value, wrap_system_tags=True
         )
         self._run_injection(
             record, request,
-            strategy_label="cache_aware (burst, no reset -- preserves the live RingKVCache)",
-            prompt_text=wrap_with_system_tags(knowledge_block),
-            context_text=knowledge_block,
+            strategy_label=strategy_label,
+            prompt_text=wrap_with_system_tags(injection_text),
+            context_text=injection_text,
         )
         return record.to_dict()
 
@@ -631,9 +741,9 @@ class RAGSession:
         if retrieval is None:
             return record.to_dict()
 
-        knowledge_block = "\n".join(retrieval["contexts"])
+        injection_text, found = self._build_injection_text(retrieval, query)
         request = InjectionRequest(
-            text=knowledge_block, mode=InjectionMode.CACHE_AWARE.value, wrap_system_tags=True
+            text=injection_text, mode=InjectionMode.CACHE_AWARE.value, wrap_system_tags=True
         )
 
         t0 = time.monotonic()
@@ -643,7 +753,9 @@ class RAGSession:
 
         record.injection_strategy = (
             "cache_aware (naive reset_and_replay baseline -- reset_streaming() + full "
-            "persona/voice prompt replay + reinjection)"
+            "persona/voice prompt replay + reinjection)" if found else
+            "cache_aware (naive reset_and_replay baseline -- out-of-scope decline notice, no "
+            "relevant knowledge found)"
         )
         record.injected_token_count = stats.token_count
         record.injection_latency_s = replay_and_injection_latency_s
@@ -661,9 +773,9 @@ class RAGSession:
         if retrieval is None:
             return record.to_dict()
 
-        knowledge_block = "\n".join(retrieval["contexts"])
+        injection_text, found = self._build_injection_text(retrieval, query)
         request = InjectionRequest(
-            text=knowledge_block, mode=InjectionMode.CACHE_AWARE.value, wrap_system_tags=True
+            text=injection_text, mode=InjectionMode.CACHE_AWARE.value, wrap_system_tags=True
         )
 
         t0 = time.monotonic()
@@ -673,7 +785,9 @@ class RAGSession:
 
         record.injection_strategy = (
             "cache_aware (naive reset_and_replay baseline -- reset_streaming() + full "
-            "persona/voice prompt replay + reinjection)"
+            "persona/voice prompt replay + reinjection)" if found else
+            "cache_aware (naive reset_and_replay baseline -- out-of-scope decline notice, no "
+            "relevant knowledge found)"
         )
         record.injected_token_count = stats.token_count
         record.injection_latency_s = replay_and_injection_latency_s

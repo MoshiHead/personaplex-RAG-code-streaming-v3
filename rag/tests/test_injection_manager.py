@@ -12,6 +12,8 @@ import unittest
 from rag.injection_manager import (
     InjectionRequest,
     TokenInjector,
+    build_out_of_scope_notice,
+    build_scoped_knowledge_block,
     wrap_with_system_tags,
 )
 
@@ -64,6 +66,39 @@ class TestWrapWithSystemTags(unittest.TestCase):
             wrap_with_system_tags("  spaced out  "),
             "<system> spaced out <system>",
         )
+
+
+class TestBuildScopedKnowledgeBlock(unittest.TestCase):
+    def test_includes_the_knowledge_block_verbatim(self):
+        result = build_scoped_knowledge_block("RobotBulls was founded in 2020.", "I don't know.")
+        self.assertIn("RobotBulls was founded in 2020.", result)
+
+    def test_includes_the_exact_refusal_message_quoted(self):
+        result = build_scoped_knowledge_block("some facts", "I can only answer from the docs.")
+        self.assertIn('"I can only answer from the docs."', result)
+
+    def test_instructs_the_model_not_to_use_its_own_knowledge(self):
+        result = build_scoped_knowledge_block("some facts", "decline phrase")
+        self.assertIn("ONLY", result)
+        self.assertIn("do not guess", result.lower())
+
+
+class TestBuildOutOfScopeNotice(unittest.TestCase):
+    def test_includes_the_exact_refusal_message_quoted(self):
+        result = build_out_of_scope_notice("I can only answer from the docs.")
+        self.assertIn('"I can only answer from the docs."', result)
+
+    def test_mentions_the_specific_query_when_given(self):
+        result = build_out_of_scope_notice("decline phrase", query="What's the weather today?")
+        self.assertIn("What's the weather today?", result)
+
+    def test_omits_the_query_clause_when_none(self):
+        result = build_out_of_scope_notice("decline phrase", query=None)
+        self.assertNotIn("The user asked", result)
+
+    def test_instructs_the_model_not_to_use_its_own_knowledge(self):
+        result = build_out_of_scope_notice("decline phrase")
+        self.assertIn("Do not answer using your own knowledge", result)
 
 
 class TestTokenInjectorBlocking(unittest.TestCase):

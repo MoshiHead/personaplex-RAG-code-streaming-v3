@@ -40,7 +40,7 @@ concern.
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Optional, Protocol, runtime_checkable
 import time
 
 
@@ -62,6 +62,41 @@ class TextTokenizerLike(Protocol):
     """Minimal protocol satisfied by `sentencepiece.SentencePieceProcessor` (and test stand-ins)."""
 
     def encode(self, text: str) -> list: ...
+
+
+def build_scoped_knowledge_block(knowledge_block: str, refusal_message: str) -> str:
+    """Wraps a retrieved knowledge block with an explicit instruction restricting the model to
+    answering only from this knowledge -- the fix for "the assistant frequently ignores the
+    relevant content and generates hallucinated answers from the model's own knowledge" (see
+    docs/PRODUCTION_RAG.md). Injecting the facts alone, with no instruction, leaves the model free
+    to blend its own pretrained knowledge in alongside (or instead of) the retrieved facts; this
+    text is what tells it not to.
+
+    `refusal_message` is the exact phrase the model should fall back to for anything the knowledge
+    doesn't cover -- see `RAGConfig.refusal_message`. Pure string formatting, independent of
+    whether the caller wraps the result in `<system>` tags (`InjectionRequest.wrap_system_tags`)
+    or not, so it composes with every injection mode (B/C/D/E/F) unchanged.
+    """
+    return (
+        "You must answer ONLY using the information provided below. Do not use any other "
+        "knowledge you may have, and do not guess or make up an answer. If the user's question "
+        f"is not covered by this information, respond only with: \"{refusal_message}\"\n\n"
+        f"{knowledge_block}"
+    )
+
+
+def build_out_of_scope_notice(refusal_message: str, query: Optional[str] = None) -> str:
+    """Instruction text for when retrieval found nothing relevant -- either to a specific `query`
+    (an explicit `rag_query`/`--rag-query` that scored below `score_threshold` against every
+    chunk), or to no query at all (the knowledge base itself is empty). Tells the model to decline
+    rather than fall back to its own pretrained knowledge, instead of the previous behavior of
+    injecting nothing at all and leaving the model free to answer however it likes.
+    """
+    about = f' The user asked: "{query}".' if query else ""
+    return (
+        f"No information in the knowledge base is relevant to the current question.{about} "
+        f"Do not answer using your own knowledge or guess. Respond only with: \"{refusal_message}\""
+    )
 
 
 def wrap_with_system_tags(text: str) -> str:
